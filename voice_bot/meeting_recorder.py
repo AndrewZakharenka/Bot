@@ -1,13 +1,12 @@
 """
 meeting_recorder.py — запись системного аудио + микрофона (WASAPI loopback).
 
-Два потока записываются параллельно и микшируются в один WAV-файл:
+Два потока записываются параллельно:
   - loopback: всё что играет на ПК (голос собеседника в Zoom/Meet/Teams)
   - микрофон: ваш голос
 
-Публичные методы:
-    start()          — начинает запись (в фоновом потоке)
-    stop() -> path   — останавливает запись, возвращает путь к WAV-файлу
+stop() возвращает dict {"loopback": path_or_None, "mic": path_or_None}
+с WAV-файлами в 16 kHz mono — оптимальный формат для Whisper.
 """
 import os
 import wave
@@ -28,8 +27,8 @@ except ImportError:
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
-TARGET_RATE = 44100
-TARGET_CHANNELS = 2
+WHISPER_RATE = 16000   # Whisper нативно работает с 16 kHz mono
+TARGET_RATE = 44100    # для внутренних вычислений loopback
 
 
 def _find_loopback_device(pa):
@@ -75,7 +74,7 @@ def _bytes_to_array(raw: bytes, channels: int) -> np.ndarray:
     return arr
 
 
-def _resample(arr: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+def _resample_arr(arr: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     """Ресемплирует массив (samples, channels) с src_rate на dst_rate."""
     if src_rate == dst_rate:
         return arr
@@ -86,24 +85,41 @@ def _resample(arr: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     return resampled.astype(np.int16)
 
 
-def _to_stereo(arr: np.ndarray) -> np.ndarray:
-    """Моно (N,1) → стерео (N,2)."""
-    if arr.shape[1] == 1:
-        return np.column_stack([arr, arr])
-    return arr
+def _save_16k_mono(frames: list[bytes], src_rate: int, src_channels: int) -> str | None:
+    """
+    Конвертирует записанные фреймы в 16 kHz mono WAV (формат для Whisper).
+    Нормализует громкость. Возвращает путь к временному файлу или None.
+    """
+    if not frames:
+        return None
 
+    raw = b"".join(frames)
+    arr = _bytes_to_array(raw, src_channels)
 
-def _mix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Микширует два стерео-массива одинаковой длины (среднее, без клиппинга)."""
-    min_len = min(len(a), len(b))
-    a = a[:min_len].astype(np.int32)
-    b = b[:min_len].astype(np.int32)
-    mixed = ((a + b) // 2).astype(np.int16)
-    return mixed
+    # Mono: усредняем каналы
+    if arr.shape[1] > 1:
+        arr = arr.mean(axis=1, keepdims=True).astype(np.int16)
+
+    # Ресемплируем до 16 kHz
+    arr = _resample_arr(arr, src_rate, WHISPER_RATE)
+
+    # Нормализуем громкость (тихие сигналы усиливаем до 90% от макс)
+    peak = np.abs(arr).max()
+    if 0 < peak < 16000:
+        arr = (arr.astype(np.float32) * (32767 / peak) * 0.9).astype(np.int16)
+
+    tmp = tempfile.mktemp(suffix=".wav")
+    with wave.open(tmp, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)   # int16 = 2 bytes
+        wf.setframerate(WHISPER_RATE)
+        wf.writeframes(arr.tobytes())
+
+    return tmp
 
 
 class MeetingRecorder:
-    """Записывает системный звук + микрофон и сохраняет смешанный WAV."""
+    """Записывает системный звук + микрофон, сохраняет раздельные 16 kHz WAV."""
 
     def __init__(self):
         self._pa = None
@@ -115,8 +131,12 @@ class MeetingRecorder:
         self._loopback_frames: list[bytes] = []
         self._mic_frames: list[bytes] = []
         self._loopback_rate: int = TARGET_RATE
-        self._loopback_channels: int = TARGET_CHANNELS
+        self._loopback_channels: int = 2
         self._mic_rate: int = TARGET_RATE
+
+        # Реальное смещение старта каждого потока от _start_time (сек)
+        self._loopback_start_offset: float = 0.0
+        self._mic_start_offset: float = 0.0
 
         self._loopback_thread: threading.Thread | None = None
         self._mic_thread: threading.Thread | None = None
@@ -137,7 +157,7 @@ class MeetingRecorder:
         loopback = _find_loopback_device(self._pa)
         if loopback:
             self._loopback_rate = int(loopback.get("defaultSampleRate", TARGET_RATE))
-            self._loopback_channels = loopback.get("maxInputChannels", TARGET_CHANNELS)
+            self._loopback_channels = loopback.get("maxInputChannels", 2)
             self._loopback_stream = self._pa.open(
                 format=FORMAT,
                 channels=self._loopback_channels,
@@ -152,8 +172,10 @@ class MeetingRecorder:
                 daemon=True,
             )
             self._loopback_thread.start()
+            self._loopback_start_offset = time.time() - self._start_time
             print(f"[MeetingRecorder] Loopback: '{loopback['name']}' "
-                  f"({self._loopback_channels}ch, {self._loopback_rate}Hz)")
+                  f"({self._loopback_channels}ch, {self._loopback_rate}Hz, "
+                  f"offset={self._loopback_start_offset:.3f}s)")
         else:
             print("[MeetingRecorder] Loopback не найден — системный звук не будет записан.")
 
@@ -174,7 +196,9 @@ class MeetingRecorder:
                 daemon=True,
             )
             self._mic_thread.start()
-            print(f"[MeetingRecorder] Микрофон: '{mic_info['name']}' (1ch, {self._mic_rate}Hz)")
+            self._mic_start_offset = time.time() - self._start_time
+            print(f"[MeetingRecorder] Микрофон: '{mic_info['name']}' "
+                  f"(1ch, {self._mic_rate}Hz, offset={self._mic_start_offset:.3f}s)")
         except Exception as e:
             print(f"[MeetingRecorder] Микрофон недоступен: {e}")
 
@@ -191,9 +215,14 @@ class MeetingRecorder:
 
     # ── Остановка ─────────────────────────────────────────────
 
-    def stop(self) -> str:
+    def stop(self) -> dict:
+        """
+        Останавливает запись.
+        Возвращает dict {"loopback": path_or_None, "mic": path_or_None}
+        с 16 kHz mono WAV-файлами, готовыми для Whisper.
+        """
         if not self._recording:
-            return ""
+            return {"loopback": None, "mic": None}
 
         self._recording = False
         duration = time.time() - self._start_time
@@ -212,57 +241,24 @@ class MeetingRecorder:
 
         self._pa.terminate()
 
-        # — Микширование —
-        wav_path = self._mix_and_save()
-        print(f"[MeetingRecorder] Запись остановлена ({duration:.1f} сек). Файл: {wav_path}")
-        return wav_path
+        # Сохраняем каждый поток отдельно в 16 kHz mono
+        loopback_path = _save_16k_mono(
+            self._loopback_frames, self._loopback_rate, self._loopback_channels
+        )
+        mic_path = _save_16k_mono(
+            self._mic_frames, self._mic_rate, 1
+        )
 
-    def _mix_and_save(self) -> str:
-        """Микширует loopback + микрофон и сохраняет WAV."""
-        tmp = tempfile.mktemp(suffix=".wav")
-
-        has_loopback = bool(self._loopback_frames)
-        has_mic = bool(self._mic_frames)
-
-        if not has_loopback and not has_mic:
-            # Нечего сохранять — пустой файл
-            with wave.open(tmp, "wb") as wf:
-                wf.setnchannels(TARGET_CHANNELS)
-                wf.setsampwidth(2)
-                wf.setframerate(TARGET_RATE)
-                wf.writeframes(b"")
-            return tmp
-
-        # Собираем loopback в массив
-        if has_loopback:
-            raw_lb = b"".join(self._loopback_frames)
-            arr_lb = _bytes_to_array(raw_lb, self._loopback_channels)
-            arr_lb = _resample(arr_lb, self._loopback_rate, TARGET_RATE)
-            arr_lb = _to_stereo(arr_lb)
-
-        # Собираем микрофон в массив
-        if has_mic:
-            raw_mic = b"".join(self._mic_frames)
-            arr_mic = _bytes_to_array(raw_mic, 1)
-            arr_mic = _resample(arr_mic, self._mic_rate, TARGET_RATE)
-            arr_mic = _to_stereo(arr_mic)
-
-        # Выбираем результат
-        if has_loopback and has_mic:
-            mixed = _mix(arr_lb, arr_mic)
-        elif has_loopback:
-            mixed = arr_lb
-        else:
-            mixed = arr_mic
-
-        # Сохраняем
-        with wave.open(tmp, "wb") as wf:
-            wf.setnchannels(TARGET_CHANNELS)
-            wf.setsampwidth(2)  # int16 = 2 bytes
-            wf.setframerate(TARGET_RATE)
-            wf.writeframes(mixed.tobytes())
-
-        return tmp
+        print(
+            f"[MeetingRecorder] Запись остановлена ({duration:.1f} сек). "
+            f"Loopback: {loopback_path}, Mic: {mic_path}"
+        )
+        return {
+            "loopback": loopback_path,
+            "mic": mic_path,
+            "loopback_offset": self._loopback_start_offset,
+            "mic_offset": self._mic_start_offset,
+        }
 
     @property
     def elapsed_seconds(self) -> float:

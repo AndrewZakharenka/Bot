@@ -82,18 +82,19 @@ class MeetingTab(ctk.CTkFrame):
             text_color="#aaaaaa",
         ).pack(anchor="w", padx=16, pady=(4, 2))
 
-        self.transcript_box = self._make_textbox(height=180)
+        self.transcript_box = self._make_textbox(height=160)
         self.transcript_box.pack(fill="x", padx=16, pady=(0, 8))
 
         # ── МОМ ───────────────────────────────────────────────
         ctk.CTkLabel(
             self, text="МОМ — итоги встречи",
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ctk.CTkFont(size=14, weight="bold"),
             text_color="#aaaaaa",
         ).pack(anchor="w", padx=16, pady=(4, 2))
 
-        self.mom_box = self._make_textbox(height=220)
-        self.mom_box.pack(fill="x", padx=16, pady=(0, 12))
+        # fill="both" + expand=True — блок растягивается вместе с окном
+        self.mom_box = self._make_textbox(height=380)
+        self.mom_box.pack(fill="both", expand=True, padx=16, pady=(0, 12))
 
     def _make_textbox(self, height: int) -> ctk.CTkTextbox:
         """Создаёт read-only текстовое поле с поддержкой копирования."""
@@ -200,17 +201,19 @@ class MeetingTab(ctk.CTkFrame):
 
     def _process_recording(self, duration: float):
         """Выполняется в worker-потоке: стоп → транскрипция → МОМ → сохранение."""
+        paths: dict[str, str | None] = {}
         try:
-            # Стоп записи
-            wav_path = self._recorder.stop()
+            # Стоп записи — получаем dict {"loopback": path, "mic": path}
+            paths = self._recorder.stop()
 
-            # Транскрипция
+            # Транскрипция с разделением по собеседникам
             self._set_status("⏳  Транскрибирую (Whisper)...")
-            transcript = transcriber.transcribe(wav_path)
-            try:
-                os.remove(wav_path)
-            except Exception:
-                pass
+            transcript = transcriber.transcribe_diarized(
+                paths.get("loopback"),
+                paths.get("mic"),
+                loopback_offset=paths.get("loopback_offset", 0.0),
+                mic_offset=paths.get("mic_offset", 0.0),
+            )
 
             self.after(0, lambda: self._set_text(self.transcript_box, transcript))
 
@@ -231,6 +234,14 @@ class MeetingTab(ctk.CTkFrame):
             print(f"[MeetingTab] Ошибка: {e}")
 
         finally:
+            # Удаляем временные WAV-файлы
+            for p in paths.values():
+                if p:
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
             self.after(0, lambda: self.rec_btn.configure(
                 state="normal", text="🔴  Начать запись"
             ))
